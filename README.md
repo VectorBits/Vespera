@@ -33,10 +33,3 @@ go build -o vespera src/main.go
 ./vespera --help
 ```
 
-## 📄 License
-
-Apache-2.0
-
-<div align="center">
-  <sub>Built with ❤️ for the Web3 Security Community</sub>
-</div>
