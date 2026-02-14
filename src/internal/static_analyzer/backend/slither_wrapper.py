@@ -42,6 +42,47 @@ _VERSION_CACHE = {}
 _CURRENT_SOLC_SELECT_VERSION = None
 
 
+def remove_duplicate_interfaces(code):
+    pattern = re.compile(
+        r'\binterface\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{'
+    )
+    seen = set()
+    i = 0
+    out = []
+    while True:
+        m = pattern.search(code, i)
+        if not m:
+            out.append(code[i:])
+            break
+        start = m.start()
+        out.append(code[i:start])
+        name = m.group(1)
+        brace_idx = m.end() - 1
+        depth = 0
+        j = brace_idx
+        while j < len(code):
+            ch = code[j]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        if depth != 0:
+            out.append(code[start:])
+            break
+        block = code[start:j]
+        if name in seen:
+            i = j
+            continue
+        seen.add(name)
+        out.append(block)
+        i = j
+    return ''.join(out)
+
+
 def install_solc_version(version):
     """使用 solcx 安装 Solidity 版本（如果未安装）"""
     if not version or not SOLCX_AVAILABLE:
@@ -562,6 +603,7 @@ def analyze_contract(code, config):
                             # 重新组合文件内容
                             final_lines = header_lines + cleaned_lines
                             flattened_content = '\n'.join(final_lines)
+                            flattened_content = remove_duplicate_interfaces(flattened_content)
 
                             print(f"[DEBUG] 所有注释已删除。", file=sys.stderr)
                             

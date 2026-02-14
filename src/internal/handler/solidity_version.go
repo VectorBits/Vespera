@@ -20,6 +20,10 @@ func extractSolidityVersion(code string) string {
 
 	for _, matches := range allMatches {
 		versionStr := strings.TrimSpace(matches[1])
+		if picked := pickVersionFromConstraint(versionStr); picked != "" {
+			versions = append(versions, picked)
+			continue
+		}
 		versionMatches := versionRe.FindAllStringSubmatch(versionStr, -1)
 
 		for _, vm := range versionMatches {
@@ -46,6 +50,36 @@ func extractSolidityVersion(code string) string {
 	}
 
 	return maxVersion
+}
+
+func pickVersionFromConstraint(versionStr string) string {
+	upperRe := regexp.MustCompile(`(<=|<)\s*(\d+)\.(\d+)(?:\.(\d+))?`)
+	m := upperRe.FindStringSubmatch(versionStr)
+	if m == nil {
+		return ""
+	}
+	op := m[1]
+	major, _ := strconv.Atoi(m[2])
+	minor, _ := strconv.Atoi(m[3])
+	if op == "<=" {
+		if m[4] != "" {
+			return m[2] + "." + m[3] + "." + m[4]
+		}
+		return m[2] + "." + m[3] + ".0"
+	}
+	if major == 0 {
+		switch minor {
+		case 8:
+			return "0.7.6"
+		case 7:
+			return "0.6.12"
+		case 6:
+			return "0.5.17"
+		case 5:
+			return "0.4.26"
+		}
+	}
+	return ""
 }
 
 func compareVersions(v1, v2 string) int {

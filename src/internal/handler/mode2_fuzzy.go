@@ -16,6 +16,7 @@ import (
 	"github.com/VectorBits/Vespera/src/internal/config"
 	"github.com/VectorBits/Vespera/src/internal/download"
 	"github.com/VectorBits/Vespera/src/internal/logger"
+	"github.com/VectorBits/Vespera/src/internal/solc"
 	"github.com/VectorBits/Vespera/src/internal/static_analyzer"
 	"github.com/VectorBits/Vespera/src/internal/ui"
 	"github.com/VectorBits/Vespera/src/strategy/prompts"
@@ -23,7 +24,6 @@ import (
 
 // qhello RunMode2Fuzzy Mode2 混合扫描入口 (Slither + AI)
 func RunMode2Fuzzy(ctx context.Context, cfg config.ScanConfiguration, targetChan <-chan string) error {
-	ui.PrintBanner()
 	ui.LogInfo("Mode 2 (Fuzzy Scan) Started")
 	ui.LogInfo("Log file: logs/scan_....log (Check logs folder)")
 
@@ -273,7 +273,8 @@ func processContractMode2(ctx context.Context, address string, cfg config.ScanCo
 		return nil, fmt.Errorf("get contract failed: %w", err)
 	}
 
-	if isOnlyBytecode(contractCode) {
+	cleanCode := normalizeContractCodeForAnalysis(contractCode)
+	if isOnlyBytecode(cleanCode) {
 		logger.Info("Contract %s is bytecode only, skipping", address)
 		return nil, nil
 	}
@@ -283,7 +284,7 @@ func processContractMode2(ctx context.Context, address string, cfg config.ScanCo
 	if strings.TrimSpace(cacheAddr) == "" {
 		cacheAddr = address
 	}
-	cacheKey := slitherCacheKey(contractCode, cacheAddr)
+	cacheKey := slitherCacheKey(cleanCode, cacheAddr)
 	var staticResult *static_analyzer.AnalysisResult
 	if cached, ok := res.slitherCache.Load(cacheKey); ok {
 		entry := cached.(slitherCacheEntry)
@@ -294,7 +295,7 @@ func processContractMode2(ctx context.Context, address string, cfg config.ScanCo
 		}
 	}
 	if staticResult == nil {
-		staticResult, err = runSlitherAnalysis(ctx, res.StaticAnalyzer, contractCode, effectiveAddr)
+		staticResult, err = runSlitherAnalysis(ctx, res.StaticAnalyzer, cleanCode, effectiveAddr)
 		if err != nil {
 			logger.Warn("Slither analysis failed for %s: %v", address, err)
 			return nil, nil
@@ -306,7 +307,7 @@ func processContractMode2(ctx context.Context, address string, cfg config.ScanCo
 	}
 
 	//helloq AI 验证 Slither 结果
-	verifiedVulns, stats, err := verifyDetectors(ctx, res.AI, staticResult, contractCode, effectiveAddr, promptTemplate)
+	verifiedVulns, stats, rawResponses, err := verifyDetectors(ctx, res.AI, staticResult, cleanCode, effectiveAddr, promptTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +317,9 @@ func processContractMode2(ctx context.Context, address string, cfg config.ScanCo
 
 	rawResp := fmt.Sprintf("Slither Results: %d\nAI Verified: %d",
 		len(staticResult.Detectors), stats.Verified)
+	if strings.TrimSpace(rawResponses) != "" {
+		rawResp = rawResp + "\n\n" + rawResponses
+	}
 
 	scanResult := &ScanResult{
 		Address:         address,
@@ -422,13 +426,14 @@ func buildMode2CallGraphContext(code string) (bool, string, string, string) {
 	return true, infoBuilder.String(), calleesBuilder.String(), enrichedContext
 }
 
-func verifyDetectors(ctx context.Context, aiManager *ai.Manager, staticResult *static_analyzer.AnalysisResult, code, address, template string) ([]parser.Vulnerability, VerificationStats, error) {
+func verifyDetectors(ctx context.Context, aiManager *ai.Manager, staticResult *static_analyzer.AnalysisResult, code, address, template string) ([]parser.Vulnerability, VerificationStats, string, error) {
 	var verifiedVulns []parser.Vulnerability
 	stats := VerificationStats{}
+	rawBlocks := make([]string, 0, len(staticResult.Detectors))
 
 	if len(staticResult.Detectors) == 0 {
 		logger.Info("No static issues found, skipping AI verification")
-		return verifiedVulns, stats, nil
+		return verifiedVulns, stats, "", nil
 	}
 
 	prettyCode := normalizeContractCodeForPrompt(code)
@@ -460,6 +465,7 @@ func verifyDetectors(ctx context.Context, aiManager *ai.Manager, staticResult *s
 		}
 
 		logger.Debug("AI Response:\n%s", aiResult.RawResponse)
+		rawBlocks = append(rawBlocks, fmt.Sprintf("Detector: %s\nResponse:\n%s", detector.Check, aiResult.RawResponse))
 
 		verificationResult, parseErr := aiManager.GetParser().ParseVerificationResult(aiResult.RawResponse)
 
@@ -473,6 +479,7 @@ func verifyDetectors(ctx context.Context, aiManager *ai.Manager, staticResult *s
 			severity = verificationResult.Severity
 		} else {
 			logger.Warn("Failed to parse AI response: %v", parseErr)
+			rawBlocks[len(rawBlocks)-1] = fmt.Sprintf("Detector: %s\nParseError: %v\nResponse:\n%s", detector.Check, parseErr, aiResult.RawResponse)
 			continue
 		}
 
@@ -494,7 +501,7 @@ func verifyDetectors(ctx context.Context, aiManager *ai.Manager, staticResult *s
 		}
 	}
 
-	return verifiedVulns, stats, nil
+	return verifiedVulns, stats, strings.Join(rawBlocks, "\n\n-----\n\n"), nil
 }
 
 func normalizeContractCodeForPrompt(code string) string {
@@ -504,4 +511,18 @@ func normalizeContractCodeForPrompt(code string) string {
 		sb.WriteString(fmt.Sprintf("%d: %s\n", i+1, line))
 	}
 	return sb.String()
+}
+
+func normalizeContractCodeForAnalysis(code string) string {
+	cleaned, _ := solc.DetachMetadata(code)
+	cleaned = strings.TrimSpace(cleaned)
+	if strings.HasPrefix(cleaned, "{{") && strings.HasSuffix(cleaned, "}}") && len(cleaned) >= 4 {
+		cleaned = strings.TrimSpace(cleaned[1 : len(cleaned)-1])
+	}
+	if solc.IsJSONSource(cleaned) {
+		if flattened, err := solc.FlattenJSONSource(cleaned); err == nil && strings.TrimSpace(flattened) != "" {
+			cleaned = flattened
+		}
+	}
+	return cleaned
 }
